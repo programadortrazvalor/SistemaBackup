@@ -1,0 +1,2 @@
+<?php
+return ['default'=>env('MAIL_MAILER','log'),'mailers'=>['log'=>['transport'=>'log','channel'=>'single'],'smtp'=>['transport'=>'smtp','scheme'=>env('MAIL_SCHEME'),'url'=>env('MAIL_URL'),'host'=>env('MAIL_HOST','127.0.0.1'),'port'=>env('MAIL_PORT',587),'username'=>env('MAIL_USERNAME'),'password'=>env('MAIL_PASSWORD'),'timeout'=>30,'local_domain'=>env('MAIL_EHLO_DOMAIN')]],'from'=>['address'=>env('MAIL_FROM_ADDRESS','backup@example.com'),'name'=>env('MAIL_FROM_NAME','Backup Manager')]];

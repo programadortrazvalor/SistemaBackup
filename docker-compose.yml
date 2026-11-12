@@ -1,0 +1,58 @@
+name: trazvalor-backup
+services:
+  app:
+    build: .
+    image: trazvalor-backup:local
+    container_name: Trazvalor-backup
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BACKUP_DATA_PATH: /data
+      BACKUP_APP_PATH: /var/www/html
+      DB_DATABASE: /data/control.sqlite
+    ports:
+      - "127.0.0.1:${APP_PORT:-8190}:80"
+    volumes:
+      - backup_data:/data
+      - app_storage:/var/www/html/storage
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/up"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  worker:
+    image: trazvalor-backup:local
+    container_name: Trazvalor-backup-worker
+    command: ["worker"]
+    restart: unless-stopped
+    stop_grace_period: 40s
+    env_file: .env
+    environment:
+      BACKUP_DATA_PATH: /data
+      BACKUP_APP_PATH: /var/www/html
+      DB_DATABASE: /data/control.sqlite
+    depends_on:
+      app:
+        condition: service_healthy
+    volumes:
+      - backup_data:/data
+      - worker_storage:/var/www/html/storage
+      - ./certs:/certs:ro
+      # Monte um destino remoto já configurado no host para habilitar a cópia externa:
+      # - /mnt/backup-remoto:/external
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  backup_data:
+  app_storage:
+  worker_storage:
