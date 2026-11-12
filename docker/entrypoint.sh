@@ -4,7 +4,7 @@ umask 0077
 mkdir -p /data /data/keys /data/tmp /data/backups /run/php storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
 chown www-data:www-data /data /data/keys /data/tmp /data/backups /run/php
 chown -R www-data:www-data storage bootstrap/cache
-gosu www-data python3 docker/provision.py
+gosu www-data /opt/worker-venv/bin/python docker/provision.py
 if [ "${1:-serve}" = "worker" ]; then
     exec gosu www-data /opt/worker-venv/bin/python python/worker.py
 fi

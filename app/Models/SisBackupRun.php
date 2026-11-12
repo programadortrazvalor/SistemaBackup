@@ -1,8 +1,9 @@
 <?php
 namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
-class BackupRun extends Model {
+class SisBackupRun extends Model {
+    protected $table='sis_backup_runs';
     protected $guarded=['id'];
     protected function casts(): array {return ['started_at'=>'datetime','finished_at'=>'datetime','details'=>'array','size_bytes'=>'integer','sql_bytes'=>'integer'];}
-    public function databaseServer(){return $this->belongsTo(DatabaseServer::class);}
+    public function databaseServer(){return $this->belongsTo(SisDatabaseServer::class,'database_server_id');}
 }

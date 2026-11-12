@@ -14,9 +14,9 @@ COPY app ./app
 RUN composer dump-autoload --no-dev --optimize --no-scripts
 
 FROM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive TZ=America/Cuiaba BACKUP_DATA_PATH=/data BACKUP_APP_PATH=/var/www/html DB_DATABASE=/data/control.sqlite
+ENV DEBIAN_FRONTEND=noninteractive TZ=America/Cuiaba BACKUP_DATA_PATH=/data BACKUP_APP_PATH=/var/www/html
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    php8.3-cli php8.3-fpm php8.3-sqlite3 php8.3-mbstring php8.3-xml php8.3-curl php8.3-zip \
+    php8.3-cli php8.3-fpm php8.3-pgsql php8.3-mbstring php8.3-xml php8.3-curl php8.3-zip \
     mysql-client gzip python3 python3-venv nginx supervisor gosu curl ca-certificates tzdata util-linux \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /var/www/html

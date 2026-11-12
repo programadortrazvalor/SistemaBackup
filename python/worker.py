@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Worker local: agenda, consome fila e executa mysqldump sem shell/senha no argv."""
+"""Worker local: agenda, consome fila e executa mysqldump sem shell/senha no argv. Controle em PostgreSQL."""
 import argparse, contextlib, datetime as dt, fcntl, gzip, hashlib, json, os
 from pathlib import Path
-import re, selectors, shutil, signal, sqlite3, subprocess, sys, tempfile, time
+import re, selectors, shutil, signal, subprocess, sys, tempfile, time
 from zoneinfo import ZoneInfo
 from crypto_stream import EncryptedWriter, verify, decrypt_to
+from pgcontrol import Control
 UTC=dt.timezone.utc
 ZONE=ZoneInfo('America/Cuiaba')
 DATA=Path(os.environ.get('BACKUP_DATA_PATH','/data'))
@@ -16,10 +17,7 @@ STOP=False
 
 def now_utc(): return dt.datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S')
 def connect():
-    con=sqlite3.connect(DATA/'control.sqlite',timeout=10)
-    con.row_factory=sqlite3.Row
-    con.execute('PRAGMA foreign_keys=ON');con.execute('PRAGMA busy_timeout=10000');con.execute('PRAGMA journal_mode=WAL')
-    return con
+    return Control()
 
 def due(schedule, now):
     at=schedule['start_time']
@@ -31,20 +29,20 @@ def due(schedule, now):
     return None
 
 def enqueue_due(con, now):
-    rows=con.execute('SELECT s.* FROM backup_schedules s JOIN database_servers d ON d.id=s.database_server_id WHERE d.enabled=1 AND s.enabled=1').fetchall()
+    rows=con.execute('SELECT s.* FROM sis_backup_schedules s JOIN sis_database_servers d ON d.id=s.database_server_id WHERE d.enabled AND s.enabled').fetchall()
     with con:
         for s in rows:
             slot=due(s,now)
             if slot:
                 stamp=now_utc()
-                con.execute("INSERT OR IGNORE INTO backup_runs(database_server_id,backup_schedule_id,scheduled_for,source,status,created_at,updated_at) VALUES(?,?,?,'schedule','queued',?,?)",(s['database_server_id'],s['id'],slot,stamp,stamp))
+                con.execute("INSERT INTO sis_backup_runs(database_server_id,backup_schedule_id,scheduled_for,source,status,created_at,updated_at) VALUES(?,?,?,'schedule','queued',?,?) ON CONFLICT DO NOTHING",(s['database_server_id'],s['id'],slot,stamp,stamp))
 
 def settings(con):
-    raw=dict(con.execute('SELECT key,value FROM backup_settings').fetchall())
+    raw={r['key']:r['value'] for r in con.execute('SELECT key,value FROM sis_backup_settings').fetchall()}
     return {'retention_count':max(1,int(raw.get('retention_count',4))),'timeout':max(60,int(raw.get('timeout_minutes',360))*60),'minimum_free':max(0,int(raw.get('minimum_free_gb',1))*1024**3),'external':raw.get('external_copy','0')=='1'}
 
 def beat(con):
-    with con: con.execute("INSERT INTO backup_settings(key,value) VALUES('worker_heartbeat',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_utc(),))
+    with con: con.execute("INSERT INTO sis_backup_settings(key,value) VALUES('worker_heartbeat',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(now_utc(),))
 
 def redact(message, password):
     text=str(message)
@@ -159,12 +157,12 @@ def perform(payload, run_id, opts, heartbeat):
         if cnf:cnf.unlink(missing_ok=True)
 
 def retention(con, database_id, keep, external):
-    rows=con.execute("SELECT id,filename FROM backup_runs WHERE database_server_id=? AND status='success' ORDER BY id DESC LIMIT -1 OFFSET ?",(database_id,keep)).fetchall()
+    rows=con.execute("SELECT id,filename FROM sis_backup_runs WHERE database_server_id=? AND status='success' ORDER BY id DESC OFFSET ?",(database_id,keep)).fetchall()
     for row in rows:
         name=Path(row['filename']).name
         (DATA/'backups'/name).unlink(missing_ok=True)
         if external:(Path(os.environ.get('BACKUP_EXTERNAL_PATH','/external'))/name).unlink(missing_ok=True)
-        with con:con.execute("UPDATE backup_runs SET status='expired',updated_at=? WHERE id=?",(now_utc(),row['id']))
+        with con:con.execute("UPDATE sis_backup_runs SET status='expired',updated_at=? WHERE id=?",(now_utc(),row['id']))
 
 def get_payload(run_id):
     result=subprocess.run([PHP,str(APP/'artisan'),'backups:payload',str(run_id),'--no-ansi'],cwd=APP,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=False)
@@ -182,13 +180,12 @@ def tick(con, schedule=True):
     if schedule:enqueue_due(con,dt.datetime.now(ZONE))
     while not STOP:
         with con:
-            con.execute('BEGIN IMMEDIATE')
-            run=con.execute("SELECT * FROM backup_runs WHERE status='queued' ORDER BY id LIMIT 1").fetchone()
+            run=con.execute("SELECT * FROM sis_backup_runs WHERE status='queued' ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED").fetchone()
             if not run:return
-            database=con.execute('SELECT enabled FROM database_servers WHERE id=?',(run['database_server_id'],)).fetchone()
+            database=con.execute('SELECT enabled FROM sis_database_servers WHERE id=?',(run['database_server_id'],)).fetchone()
             schedule_enabled=True
             if run['backup_schedule_id']:
-                row=con.execute('SELECT enabled FROM backup_schedules WHERE id=?',(run['backup_schedule_id'],)).fetchone();schedule_enabled=bool(row and row['enabled'])
+                row=con.execute('SELECT enabled FROM sis_backup_schedules WHERE id=?',(run['backup_schedule_id'],)).fetchone();schedule_enabled=bool(row and row['enabled'])
             expired_slot=False
             if run['source']=='schedule':
                 try:
@@ -196,19 +193,19 @@ def tick(con, schedule=True):
                     expired_slot=localnow.date()!=planned.date() or not 0<=(localnow-planned).total_seconds()<=21600 or localnow.strftime('%H:%M')<='17:00'
                 except (ValueError,TypeError):expired_slot=True
             if not database or not database['enabled'] or not schedule_enabled or expired_slot:
-                con.execute("UPDATE backup_runs SET status='cancelled',finished_at=?,updated_at=?,error='Banco/agendamento pausado ou janela de execução encerrada.' WHERE id=?",(now_utc(),now_utc(),run['id']));continue
-            con.execute("UPDATE backup_runs SET status='running',started_at=?,updated_at=? WHERE id=?",(now_utc(),now_utc(),run['id']))
+                con.execute("UPDATE sis_backup_runs SET status='cancelled',finished_at=?,updated_at=?,error='Banco/agendamento pausado ou janela de execução encerrada.' WHERE id=?",(now_utc(),now_utc(),run['id']));continue
+            con.execute("UPDATE sis_backup_runs SET status='running',started_at=?,updated_at=? WHERE id=?",(now_utc(),now_utc(),run['id']))
         try:
             payload=get_payload(run['id']);opts=settings(con)
             result=perform(payload,run['id'],opts,lambda:beat(con))
             with con:
-                con.execute("UPDATE backup_runs SET status='success',finished_at=?,updated_at=?,filename=?,size_bytes=?,sql_bytes=?,sha256=?,details=? WHERE id=?",(now_utc(),now_utc(),result['filename'],result['size_bytes'],result['sql_bytes'],result['sha256'],result['details'],run['id']))
+                con.execute("UPDATE sis_backup_runs SET status='success',finished_at=?,updated_at=?,filename=?,size_bytes=?,sql_bytes=?,sha256=?,details=? WHERE id=?",(now_utc(),now_utc(),result['filename'],result['size_bytes'],result['sql_bytes'],result['sha256'],result['details'],run['id']))
             try:retention(con,run['database_server_id'],opts['retention_count'],opts['external'])
             except Exception:
-                with con:con.execute('UPDATE backup_runs SET error=? WHERE id=?',('Backup concluído; retenção falhou. Confira disco e permissões.',run['id']))
+                with con:con.execute('UPDATE sis_backup_runs SET error=? WHERE id=?',('Backup concluído; retenção falhou. Confira disco e permissões.',run['id']))
             print(f"Backup #{run['id']} concluído.",flush=True)
         except Exception as e:
-            with con:con.execute("UPDATE backup_runs SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?",(now_utc(),now_utc(),str(e)[-4000:],run['id']))
+            with con:con.execute("UPDATE sis_backup_runs SET status='failed',finished_at=?,updated_at=?,error=? WHERE id=?",(now_utc(),now_utc(),str(e)[-4000:],run['id']))
             print(f"Backup #{run['id']} falhou. Consulte o histórico.",flush=True);notify(run['id'])
         beat(con)
 
@@ -233,7 +230,7 @@ def main():
         try:
             for pattern in ('mysql-*.cnf','*.partial'):
                 for stale in (DATA/'tmp').glob(pattern):stale.unlink(missing_ok=True)
-            with con:con.execute("UPDATE backup_runs SET status='failed',finished_at=?,updated_at=?,error='Worker interrompido. Confira os recursos e solicite um novo teste.' WHERE status='running'",(now_utc(),now_utc()))
+            with con:con.execute("UPDATE sis_backup_runs SET status='failed',finished_at=?,updated_at=?,error='Worker interrompido. Confira os recursos e solicite um novo teste.' WHERE status='running'",(now_utc(),now_utc()))
             while not STOP:
                 tick(con)
                 if args.once:break

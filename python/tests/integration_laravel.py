@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix='laravel-python-qa-') as tmp:
  subprocess.run([PHP,str(ROOT/'tests/seed-worker.php')],cwd=ROOT,env=env,check=True,capture_output=True)
  subprocess.run([sys.executable,str(ROOT/'python/worker.py'),'--once'],cwd=ROOT,env=env,check=True)
  con=sqlite3.connect(data/'control.sqlite');con.row_factory=sqlite3.Row
- run=con.execute('SELECT * FROM backup_runs').fetchone()
+ run=con.execute('SELECT * FROM sis_backup_runs').fetchone()
  assert run['status']=='success',dict(run)
  assert (data/'backups'/run['filename']).exists()
  assert 'dummy-secret-password' not in (data/'control.sqlite').read_bytes().decode(errors='ignore')
