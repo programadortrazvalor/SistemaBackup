@@ -77,6 +77,8 @@ services:
       - backup_data:/data
       - worker_storage:/var/www/html/storage
       - ./certs:/certs:ro
+      # Arquivos SQLite a copiar: coloque-os em ./sqlite (cadastre só o nome do arquivo no painel).
+      - ./sqlite:/sqlite:ro
       # Monte um destino remoto já configurado no host para habilitar a cópia externa:
       # - /mnt/backup-remoto:/external
     logging:

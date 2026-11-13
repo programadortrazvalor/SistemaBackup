@@ -85,3 +85,41 @@ def decrypt_to(path, target, master):
     except BaseException:
         if created: Path(target).unlink(missing_ok=True)
         raise
+
+def write_zip(raw, path, master, inner_name):
+    """Descriptografa, descompacta o gzip e escreve o .sql dentro de um .zip em `raw`.
+    Funciona em saída não pesquisável (pipe/HTTP): o zipfile usa data descriptor e ZIP64."""
+    import zipfile, itertools
+    chunks=plaintext_chunks(path,master)
+    first=next(chunks,None)  # autentica o 1º bloco antes de escrever qualquer byte do ZIP (chave errada = erro limpo)
+    if first is None: raise ValueError('Backup vazio.')
+    with zipfile.ZipFile(raw,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as zf:
+        with zf.open(inner_name,'w',force_zip64=True) as entry:
+            dec=zlib.decompressobj(16+zlib.MAX_WBITS)
+            for chunk in itertools.chain([first],chunks):
+                while chunk:
+                    entry.write(dec.decompress(chunk,CHUNK)); chunk=dec.unconsumed_tail
+                if dec.unused_data: raise ValueError('Dados extras após gzip.')
+            if not dec.eof: raise ValueError('Gzip incompleto.')
+
+class _Unseekable:
+    """Força o modo streaming do zipfile mesmo quando stdout é um arquivo."""
+    def __init__(self, out): self.out=out
+    def write(self, data): return self.out.write(data)
+    def flush(self): self.out.flush()
+    def seekable(self): return False
+    def tell(self): raise OSError('não pesquisável')
+
+def export_zip(path, target, master, inner_name):
+    if target=='-':
+        import sys
+        out=sys.stdout.buffer; write_zip(_Unseekable(out),path,master,inner_name); out.flush(); return
+    created=False
+    try:
+        with open(target,'xb') as raw:
+            created=True; os.chmod(target,0o600)
+            write_zip(raw,path,master,inner_name)
+            raw.flush(); os.fsync(raw.fileno())
+    except BaseException:
+        if created: Path(target).unlink(missing_ok=True)
+        raise

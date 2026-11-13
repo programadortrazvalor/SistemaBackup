@@ -1,257 +1,554 @@
-# Backup Manager — Laravel + Python + Vue.js
+# Backup Manager — Sistema Traz Valor
 
-Sistema completo de controle e execução de backups de bancos MySQL remotos.
+Painel para cadastrar bancos de dados, agendar backups automáticos, acompanhar o histórico e baixar as cópias em ZIP.
 
 | Parte | Tecnologia | Função |
 |---|---|---|
-| Backend e API | Laravel 12 / PHP 8.3 | Login, cadastros, regras, fila, histórico e downloads |
-| Execução | Python 3.12 | Agendamento, mysqldump, compressão, criptografia e retenção |
-| Frontend | Vue 3 / Vite | Painel, formulários e atualização do histórico |
-| Controle interno | SQLite em volume persistente | Metadados e fila compartilhados entre Laravel e Python |
-| Bancos de origem | MySQL | Bancos que serão copiados, sem alteração de seus dados |
+| Painel (frontend) | Vue 3 + Vite | Telas, formulários, histórico e dicas de correção de erros |
+| API (backend) | Laravel 12 / PHP 8.3 | Login, cadastros, validações, fila e download |
+| Executor (worker) | Python 3.12 | Agendamento, dump, compressão, criptografia, retenção e cópia externa |
+| Banco de controle | PostgreSQL 16 (container próprio) | Usuários, bancos cadastrados, agendamentos, fila e histórico |
+| Bancos copiados | **MySQL**, **PostgreSQL** e **SQLite** | Origem dos backups (somente leitura; os dados de origem não são alterados) |
 
-Esta entrega substitui o projeto anterior em PHP puro. É uma instalação nova; os formatos de arquivo/chaves do pacote anterior não são intercambiáveis com esta versão.
+Tudo roda em Docker. **Não é preciso instalar PHP, Python, Node ou Composer na máquina.**
 
-## Início rápido — Windows com Docker Desktop
+---
 
-Extraia o ZIP e entre na pasta `backup-laravel-python-vue` pelo PowerShell:
+## Sumário
+
+1. [Requisitos](#1-requisitos)
+2. [Instalação passo a passo](#2-instalação-passo-a-passo)
+3. [Configurações usadas (portas, containers, volumes e variáveis)](#3-configurações-usadas)
+4. [Roteiro de testes no painel](#4-roteiro-de-testes-no-painel)
+5. [Testes automatizados](#5-testes-automatizados)
+6. [Comandos úteis do dia a dia](#6-comandos-úteis-do-dia-a-dia)
+7. [Problemas comuns e soluções](#7-problemas-comuns-e-soluções)
+8. [Como o backup funciona por dentro](#8-como-o-backup-funciona-por-dentro)
+9. [Segurança e chaves](#9-segurança-e-chaves)
+10. [Restauração de um backup](#10-restauração-de-um-backup)
+11. [Retenção, disco e cópia externa](#11-retenção-disco-e-cópia-externa)
+12. [Colocando em produção](#12-colocando-em-produção)
+
+---
+
+## 1. Requisitos
+
+| Item | Detalhe |
+|---|---|
+| Sistema operacional | Windows 10/11, Linux ou macOS (Intel ou Apple Silicon) |
+| Docker | **Docker Desktop** (Windows/macOS) ou **Docker Engine + Docker Compose v2** (Linux) |
+| Git | Para baixar o código do repositório |
+| Memória | Pelo menos 4 GB livres para o Docker |
+| Disco | ~3 GB para as imagens + espaço para os backups (dimensione pelo tamanho dos seus bancos) |
+| Portas livres | **8190** (painel) e **5435** (PostgreSQL de controle). Podem ser trocadas no `.env` |
+| Internet | Necessária no primeiro build (baixa imagens e pacotes) e para acessar os bancos remotos |
+
+### Conferindo o Docker
+
+Abra o terminal (no Windows: **PowerShell**) e rode:
 
 ```powershell
-Copy-Item .env.example .env
-docker compose up -d --build
-docker compose exec --user www-data app php artisan backups:install
+docker --version
+docker compose version
 ```
 
-Abra **http://localhost:8190**.
+Os dois comandos precisam mostrar uma versão. No Windows, o **Docker Desktop precisa estar aberto** (ícone da baleia na bandeja, com status *Running*).
 
-O comando de instalação solicita nome, e-mail e senha do administrador e senha do MySQL. A senha do painel exige pelo menos 12 caracteres e confirmação.
+> **Windows:** o Docker Desktop deve usar o backend **WSL 2** (padrão nas versões atuais). Em *Settings → Resources*, deixe ao menos 4 GB de memória.
 
-O banco inicial já usa:
+---
 
-- Nome: DY Isenções
-- Host: `mysql29-farm15.uni5.net`
-- Porta: `3306`
-- Usuário e banco: `dyisencoes01`
-- Dias: **terça e sexta**
-- Horário: **17h30 de Cuiabá**
+## 2. Instalação passo a passo
 
-A senha informada na conversa **não está no código nem no ZIP**. Digite-a na instalação ou no cadastro do banco. Se a senha MySQL ficar vazia na instalação, o banco começa pausado.
+### Passo 1 — Baixar o código
 
-Docker instala Composer, dependências PHP, Python, cliente MySQL, Nginx e o build Vue. Não precisa ter PHP/Python/Node instalados no Windows para essa opção. A primeira construção precisa de acesso aos repositórios de pacotes e imagens.
+```powershell
+git clone https://github.com/programadortrazvalor/SistemaBackup.git
+cd SistemaBackup
+```
 
-### Linux com Docker
+> O repositório força finais de linha LF (`.gitattributes`). Não converta os arquivos para CRLF; scripts como `docker/entrypoint.sh` deixam de funcionar no container.
+
+### Passo 2 — Criar o arquivo `.env`
+
+Copie o modelo:
+
+```powershell
+# Windows (PowerShell)
+Copy-Item .env.example .env
+```
 
 ```bash
+# Linux / macOS
 cp .env.example .env
+```
+
+Abra o `.env` em um editor e **preencha obrigatoriamente** os dados do banco de controle (PostgreSQL que roda no container `db`). Os valores abaixo são exemplos; escolha os seus:
+
+```dotenv
+DB_DATABASE=trazvalor_backup
+DB_USERNAME=trazvalor
+DB_PASSWORD=TroquePorUmaSenhaForte123
+```
+
+Revise também, se necessário:
+
+| Variável | Padrão | Quando mudar |
+|---|---|---|
+| `APP_PORT` | `8190` | Se a porta 8190 já estiver em uso na sua máquina |
+| `DB_PORT` | `5435` | Se a porta 5435 já estiver em uso (é só a porta de acesso pelo host, ex.: DBeaver) |
+| `APP_URL` | `http://localhost:8190` | Acompanhe o valor de `APP_PORT` |
+| `APP_KEY` | vazio | **Deixe vazio.** A chave é gerada automaticamente no primeiro início (veja a [seção 9](#9-segurança-e-chaves)) |
+| `BACKUP_ALERT_EMAIL` | vazio | Para receber e-mail quando um backup falhar (exige configurar `MAIL_*`) |
+
+> **Importante:** `DB_DATABASE`, `DB_USERNAME` e `DB_PASSWORD` só são aplicados na **primeira** criação do volume do PostgreSQL. Se você mudar depois, o banco antigo não aceita as credenciais novas. Para recomeçar do zero em uma máquina de teste, veja [Começar do zero](#começar-do-zero-apaga-tudo).
+
+### Passo 3 — Construir e subir os containers
+
+```powershell
+docker compose up -d --build
+```
+
+O primeiro build leva de 3 a 10 minutos (depende da internet). Ele instala PHP, Nginx, Python, os clientes `mysqldump`, `pg_dump` e `sqlite3`, e compila o painel Vue.
+
+### Passo 4 — Conferir se tudo subiu
+
+```powershell
+docker compose ps
+```
+
+O resultado esperado tem três containers:
+
+| Container | Status esperado |
+|---|---|
+| `Trazvalor-backup-db` | `Up ... (healthy)` |
+| `Trazvalor-backup` | `Up ... (healthy)` (pode levar até 40 s para ficar *healthy*) |
+| `Trazvalor-backup-worker` | `Up ...` |
+
+Se algum não estiver de pé, veja os logs:
+
+```powershell
+docker compose logs --tail=100 app
+docker compose logs --tail=100 worker
+docker compose logs --tail=100 db
+```
+
+> As **migrations do banco rodam sozinhas** ao iniciar o container `app`. Não é preciso rodar `php artisan migrate`.
+
+### Passo 5 — Criar o usuário administrador
+
+```powershell
+docker compose exec --user www-data app php artisan backups:install
+```
+
+O assistente pergunta, nesta ordem:
+
+1. **Nome do administrador**
+2. **E-mail de acesso** (usado no login)
+3. **Senha do painel**: mínimo de **12 caracteres**, digitada duas vezes
+4. **Celular**, **CPF** e **data de nascimento** (formato `AAAA-MM-DD`, ex.: `1990-05-20`)
+5. **Senha MySQL do banco inicial**: somente na primeira instalação
+
+Sobre o item 5: na primeira instalação o assistente cadastra um **banco de exemplo** (MySQL em `mysql29-farm15.uni5.net`, banco/usuário `dyisencoes01`) e um agendamento de **terça e sexta às 17h30**.
+- Se você **não tem** essa senha, só aperte **Enter**: o banco é criado **inativo** e o agendamento fica pausado. Depois você edita ou exclui no painel e cadastra os seus bancos.
+- A senha digitada é guardada criptografada; ela nunca fica no código.
+
+O mesmo comando serve depois para **criar outro administrador ou trocar a senha** (ele pede confirmação e não recria bancos nem chaves).
+
+### Passo 6 — Acessar o painel
+
+Abra no navegador: **http://localhost:8190** (ou a porta que você definiu em `APP_PORT`).
+
+Entre com o e-mail e a senha criados no passo 5.
+
+No topo do painel deve aparecer o executor como conectado. Se aparecer **"O executor ainda não iniciou"** ou **"sem contato recente"**, veja [Problemas comuns](#o-painel-diz-que-o-executor-está-sem-contato).
+
+**Pronto, a instalação está concluída.** Siga para o [roteiro de testes](#4-roteiro-de-testes-no-painel).
+
+---
+
+## 3. Configurações usadas
+
+### Containers
+
+| Serviço (compose) | Nome do container | Função |
+|---|---|---|
+| `db` | `Trazvalor-backup-db` | PostgreSQL 16 de controle (dados do sistema) |
+| `app` | `Trazvalor-backup` | Nginx + PHP-FPM (painel e API). Roda as migrations ao iniciar |
+| `worker` | `Trazvalor-backup-worker` | Executor Python: agenda, executa backups e aplica retenção. Verifica a fila a cada 15 s |
+
+### Portas
+
+| Porta no host | Destino | Uso |
+|---|---|---|
+| `127.0.0.1:8190` (`APP_PORT`) | `app:80` | Painel no navegador |
+| `127.0.0.1:5435` (`DB_PORT`) | `db:5432` | Acesso opcional ao banco de controle (DBeaver, pgAdmin, psql) |
+
+As duas portas ficam presas a `127.0.0.1`: só a própria máquina acessa.
+
+### Volumes e pastas
+
+| Volume / pasta | Montado em | Conteúdo |
+|---|---|---|
+| `pg_data` | `db:/var/lib/postgresql/data` | Banco de controle |
+| `backup_data` | `app` e `worker`: `/data` | **Chaves** (`/data/app.key`, `/data/keys/`), **backups** (`/data/backups`) e temporários (`/data/tmp`) |
+| `app_storage`, `worker_storage` | `/var/www/html/storage` | Logs e cache do Laravel |
+| `./certs` (pasta do projeto) | `/certs` (somente leitura) | Certificados CA para conexões TLS (opcional) |
+| `./sqlite` (pasta do projeto) | `worker:/sqlite` (somente leitura) | Arquivos SQLite locais a serem copiados (opcional) |
+
+> **Nunca rode `docker compose down -v`** numa instalação que você quer manter: o `-v` apaga os volumes, ou seja, **chaves, backups e todo o cadastro**.
+
+### Fuso horário e regras fixas
+
+- Todo agendamento usa o fuso **America/Cuiaba** (UTC−04:00), independente do fuso da máquina.
+- Agendamentos só podem ser **entre 17:01 e 23:59**. Backups de teste manuais rodam a qualquer hora.
+- Um agendamento perdido (máquina desligada, por exemplo) ainda roda até **6 horas** depois, no mesmo dia; depois disso é cancelado.
+- Os bancos são processados **um por vez**.
+
+---
+
+## 4. Roteiro de testes no painel
+
+Siga na ordem para validar o sistema inteiro numa máquina nova.
+
+### 4.1 Cadastrar um banco MySQL
+
+1. Menu **Bancos de dados → Adicionar banco**.
+2. Preencha:
+
+| Campo | O que colocar |
+|---|---|
+| Nome do banco | Nome para exibir no painel (ex.: *Traz Valor*) |
+| Tipo de banco | **MySQL** |
+| Host MySQL | Endereço do servidor (ex.: `mysql.seudominio.com.br`), sem `http://` |
+| Porta | `3306` |
+| Banco de dados | Nome exato do banco no servidor |
+| Usuário / Senha MySQL | Credenciais com permissão de leitura no banco |
+| Conexão TLS | **Exigir TLS** se o servidor suporta; **Sem TLS / túnel externo** se não suporta (comum em hospedagens compartilhadas) |
+| Arquivo CA | Opcional. Nome de um `.pem` colocado na pasta `certs/` |
+| Consistência do backup | Veja a tabela abaixo |
+
+| Consistência | Quando usar |
+|---|---|
+| **Transação InnoDB** | Banco só com tabelas InnoDB. Não bloqueia gravações |
+| **Bloqueio das tabelas do banco (MyISAM)** | Banco com tabelas **MyISAM** (sistemas legados). Bloqueia gravações **só deste banco** durante a cópia. Exige a permissão `LOCK TABLES` |
+| **Bloqueio global — legado** | Último recurso. Bloqueia a instância inteira e exige a permissão `RELOAD` (normalmente indisponível em hospedagem compartilhada) |
+
+3. Deixe **Banco ativo** marcado e clique em **Salvar banco**.
+
+> **Hospedagens (uni5, KingHost etc.):** libere o **IP público da sua máquina** no "Acesso remoto ao MySQL" do painel da hospedagem; sem isso, a conexão é recusada.
+
+### 4.2 Cadastrar um banco PostgreSQL (opcional)
+
+Mesmo formulário, com **Tipo de banco = PostgreSQL** e porta `5432`. A consistência é sempre por snapshot (sem bloqueio).
+
+> O cliente `pg_dump` da imagem é a versão **16**. Ele copia servidores PostgreSQL **até a versão 16**. Para servidores mais novos, é preciso atualizar o pacote `postgresql-client` no `Dockerfile`.
+
+### 4.3 Cadastrar um banco SQLite (opcional)
+
+Há duas formas:
+
+**a) Arquivo local**: copie o arquivo para a pasta `sqlite/` do projeto (ex.: `sqlite/sistema.sqlite`). No painel, use **Tipo = SQLite**, deixe o **Host em branco** e em "Arquivo na pasta sqlite/" informe só o nome: `sistema.sqlite`.
+
+**b) Arquivo em servidor remoto (SFTP/SSH)**: **Tipo = SQLite**, preencha **Host SSH**, **Porta** (normalmente `22`), **Usuário SSH**, **Senha SSH** e o **caminho completo** do arquivo no servidor (ex.: `/home/usuario/app/database.sqlite`). O arquivo é baixado e o backup é gerado da cópia.
+- Na primeira conexão a chave SSH do servidor é registrada. Se ela mudar depois, o backup é recusado por segurança.
+- Prefira horários sem gravação no banco; cópia de SQLite em uso pode sair inconsistente.
+
+### 4.4 Gerar um backup de teste
+
+1. Em **Bancos de dados**, clique em **Gerar backup de teste** no banco cadastrado.
+2. O sistema leva você ao **Histórico**. O status passa de *Na fila* → *Em execução* → *Concluído* (a tela atualiza sozinha a cada 10 s).
+3. Abra **Detalhes da execução** para ver início, fim, SHA-256 e informações do dump.
+
+### 4.5 Testar as dicas de erro
+
+Force um erro de propósito, por exemplo com uma senha errada, e gere um backup de teste. No histórico, abaixo da execução que falhou, aparece um quadro amarelo com:
+
+- **o que aconteceu**, em linguagem simples;
+- **o passo a passo** para corrigir;
+- o botão **Corrigir configuração do banco**, que abre o formulário com os campos a revisar **destacados em amarelo**.
+
+Erros com dica pronta: TLS/SSL não suportado, certificado, usuário/senha recusados, banco inexistente, host não encontrado, servidor inacessível, tabelas MyISAM, falta de permissão de bloqueio, versão do PostgreSQL, arquivo SQLite/SSH, tempo limite, disco cheio e cópia externa.
+
+### 4.6 Baixar o backup
+
+No **Histórico**, clique no ícone de download de uma execução **Concluída**.
+
+- O arquivo vem em **`.zip`** com o **`.sql` dentro**, já descriptografado e pronto para importar.
+- Nome: `<nome-do-banco>_<data>_<hora>_job-<id>.zip`.
+- O ZIP é gerado **enquanto é baixado**: o download começa na hora e **não tem limite de tempo** (serve para bancos legados enormes). O tamanho total só é conhecido no fim.
+- No servidor o backup continua guardado **criptografado**.
+
+### 4.7 Criar um agendamento
+
+1. Menu **Agendamentos → Novo agendamento**.
+2. Escolha o banco, os dias da semana e o horário (entre **17:01 e 23:59**, horário de Cuiabá).
+3. Salve. O card mostra o horário e os dias escolhidos.
+
+### 4.8 Testar banco inativo × agendamento
+
+1. Em **Bancos de dados → Editar conexão**, desmarque **Banco ativo** e salve. Aparece o aviso de que os agendamentos do banco também foram pausados.
+2. Em **Agendamentos**, o card mostra *"Pausado porque o banco está inativo"*.
+3. Ao editar esse agendamento, a opção **Agendamento ativo** fica bloqueada, com o caminho para reativar o banco.
+4. Reative o banco: os agendamentos dele voltam a ficar ativos.
+
+### 4.9 Configurações
+
+Em **Configurações**, teste: backups mantidos por banco (retenção), tempo máximo do dump, reserva mínima de disco e exigência de cópia externa. As mudanças valem para as **próximas** execuções.
+
+---
+
+## 5. Testes automatizados
+
+Como os testes rodam em containers temporários, não é preciso instalar nada além do Docker. Rode a partir da pasta do projeto.
+
+### Testes da API (PHP / PHPUnit)
+
+```powershell
+docker run --rm -v "${PWD}:/src:ro" composer:2 sh -c "cp -r /src /w && cd /w && rm -rf vendor && composer install -q --no-interaction --ignore-platform-reqs && php vendor/bin/phpunit"
+```
+
+Cobre: login/logout, senha criptografada e oculta na API, validação de horários e dias, fila sem duplicação, banco pausado, edição sem perder a senha, cadastros MySQL/PostgreSQL/SQLite (local e SSH), troca de tipo de banco e sincronização banco × agendamento.
+
+### Testes do executor (Python)
+
+```powershell
+docker run --rm -v "${PWD}:/src:ro" python:3.12-slim sh -c "apt-get update -qq && apt-get install -y -qq sqlite3 >/dev/null && cp -r /src/python /w && cd /w && chmod +x tests/*.py && pip install -q -r requirements.txt && python -m unittest tests.test_worker -v"
+```
+
+Cobre: criptografia em blocos, gzip, adulteração e truncamento, chave errada, agendamento e fuso, senha escapada e ocultada, dump MySQL (simulado) incluindo MyISAM e modo de bloqueio de tabelas, `pg_dump` (simulado), SQLite local e via SFTP (simulado), proteção de caminhos, ZIP em arquivo e em fluxo, e cópia externa com checksum.
+
+### Build do painel (Vue)
+
+```powershell
+docker run --rm -v "${PWD}:/src:ro" node:22-bookworm-slim sh -c "mkdir /w && cd /w && cp /src/package*.json /src/vite.config.js . && cp -r /src/resources . && npm ci --no-audit --no-fund && npx vite build"
+```
+
+> **Linux/macOS:** troque `${PWD}` por `"$(pwd)"`. **Windows com Git Bash:** prefixe o comando com `MSYS_NO_PATHCONV=1` e use o caminho completo da pasta (ex.: `-v "C:\caminho\SistemaBackup:/src:ro"`).
+
+> O script `python/tests/integration_laravel.py` é da versão antiga com banco de controle em SQLite e **não reflete a versão atual** (PostgreSQL). Use os testes acima.
+
+---
+
+## 6. Comandos úteis do dia a dia
+
+```powershell
+# Status dos containers
+docker compose ps
+
+# Logs (acompanhar ao vivo: acrescente -f)
+docker compose logs --tail=100 worker
+docker compose logs --tail=100 app
+
+# Reiniciar sem rebuild
+docker compose restart
+
+# Atualizar após baixar código novo (git pull)
+git pull
+docker compose up -d --build
+
+# Parar tudo (os dados são preservados)
+docker compose down
+
+# Listar os backups guardados (criptografados)
+docker compose exec --user www-data worker ls -lh /data/backups
+
+# Criar outro administrador ou trocar senha
+docker compose exec --user www-data app php artisan backups:install
+```
+
+### Acessar o banco de controle (DBeaver / pgAdmin)
+
+| Campo | Valor |
+|---|---|
+| Host | `localhost` |
+| Porta | valor de `DB_PORT` (padrão `5435`) |
+| Banco / Usuário / Senha | `DB_DATABASE` / `DB_USERNAME` / `DB_PASSWORD` do `.env` |
+| Schema | valor de `DB_SCHEMA` |
+
+Tabelas principais: `sis_database_servers` (bancos), `sis_backup_schedules` (agendamentos), `sis_backup_runs` (histórico/fila), `sis_backup_settings` (configurações), `sis_usuarios` (acessos).
+
+### Limpar o histórico para novos testes
+
+Apaga **todas** as execuções e os arquivos de backup. Bancos, agendamentos e configurações são mantidos.
+
+```powershell
+docker compose exec db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "TRUNCATE sis_backup_runs RESTART IDENTITY"'
+docker compose exec --user www-data worker sh -c 'rm -f /data/backups/*.sql.gz.enc'
+```
+
+> Se o seu `DB_SCHEMA` não for `public`, use `TRUNCATE <schema>.sis_backup_runs RESTART IDENTITY`.
+
+### Começar do zero (apaga tudo)
+
+Somente em máquina de teste: apaga **cadastros, chaves e backups**.
+
+```powershell
+docker compose down -v
 docker compose up -d --build
 docker compose exec --user www-data app php artisan backups:install
 ```
 
-## Como os backups funcionam
+---
 
-1. O Vue envia as alterações à API Laravel, com sessão e proteção CSRF.
-2. Laravel criptografa a senha do banco e grava os agendamentos no banco de controle.
-3. Python consulta os agendamentos a cada 15 segundos e coloca as ocorrências devidas na fila.
-4. O worker solicita a credencial ao comando local `backups:payload`, por pipe. Não existe endpoint HTTP que devolva senhas.
-5. `mysqldump` envia o SQL em fluxo para gzip; os bytes comprimidos são imediatamente criptografados com AES-256-GCM em blocos. O SQL completo não é carregado na RAM nem gravado em disco em texto aberto.
-6. O worker valida autenticação criptográfica e gzip, calcula SHA-256, envia a cópia externa se exigida e registra o resultado.
-7. A retenção só é aplicada após um backup bem-sucedido e sua cópia externa, quando habilitada.
+## 7. Problemas comuns e soluções
 
-Os arquivos recebem nome com ID do banco, data/hora de Cuiabá e ID da execução: `db-1_2026-11-10_17-30-00_job-12.sql.gz.enc`.
+### Porta já em uso
 
-## Agendamentos e testes
+Erro `Bind for 127.0.0.1:8190 failed: port is already allocated` (ou 5435): mude `APP_PORT`/`APP_URL` (ou `DB_PORT`) no `.env` e rode `docker compose up -d` de novo.
 
-- No painel **Agendamentos**, adicione quantas rotinas precisar: banco, dias e horário.
-- Tanto o Vue quanto o Laravel validam horários **entre 17:01 e 23:59**.
-- O fuso usado é **America/Cuiaba**, independentemente do fuso do host.
-- **Gerar backup de teste** enfileira uma execução manual a qualquer hora. O Python inicia quando a fila permitir.
-- O histórico atualiza a cada 10 segundos. Não é necessário deixar o painel aberto.
-- Um único worker tem o lock de execução; um índice único no banco impede trabalhos ativos duplicados para a mesma origem.
-- Os bancos são processados sequencialmente. O horário configurado é o início previsto, não garantia de início pontual se outro banco estiver em execução.
-- Um agendamento perdido pode ser recuperado até 6 horas após seu horário, no mesmo dia. Uma ocorrência pendente que perdeu essa janela é cancelada, sem execução automática pela manhã.
-- Uma execução interrompida vira falha no próximo início do worker. Depois de verificar a causa, solicite novo teste.
-- Pausar banco ou agendamento cancela trabalhos pendentes; não interrompe um dump que já começou.
+### O painel diz que o executor está sem contato
 
-**Não configure cron ao usar o serviço `worker` do Docker.** Ele já mantém o processo em segundo plano. Para conferir:
+O worker não está rodando ou não acessa o banco de controle.
 
 ```powershell
 docker compose ps
 docker compose logs --tail=100 worker
 ```
 
-Se o primeiro comando de instalação informar que o serviço ainda não está rodando, aguarde o build/início terminar e confira os logs de `app`.
+Se o worker estiver reiniciando sem parar, confira `DB_DATABASE`, `DB_USERNAME` e `DB_PASSWORD` no `.env` e reinicie com `docker compose up -d`.
 
-## Primeiro backup real
+### `password authentication failed` no `db`/`app`/`worker` logo após instalar
 
-1. Faça login com o acesso criado no instalador.
-2. Em **Bancos de dados**, confira usuário, senha, TLS e modo de consistência.
-3. Autorize o IP público da máquina executora no provedor MySQL, se exigido.
-4. Clique em **Gerar backup de teste**.
-5. Aguarde a conclusão no histórico e confira tamanho, duração, checksum e detalhes.
-6. Baixe o arquivo e faça a restauração de teste descrita abaixo.
+As credenciais do `.env` foram trocadas depois da criação do volume `pg_data`. Volte às credenciais originais ou, em máquina de teste, [comece do zero](#começar-do-zero-apaga-tudo).
 
-Os testes desta entrega usam clientes MySQL simulados; não foi feita conexão ou cópia no banco real informado.
+### Erros de backup mais frequentes
 
-## Segurança e consistência
+O painel já mostra a dica de correção abaixo de cada falha (seção 4.5). Resumo:
 
-### TLS
+| Mensagem | Solução |
+|---|---|
+| `SSL is required but the server doesn't support it` | Conexão TLS → **Sem TLS / túnel externo** |
+| `Access denied for user` | Confira usuário/senha e libere o IP da máquina no acesso remoto da hospedagem |
+| `Unknown database` | Confira o nome exato do banco |
+| `Can't connect to MySQL server` | Confira host/porta e o acesso remoto liberado |
+| `Motores não transacionais: MyISAM` | Consistência → **Bloqueio das tabelas do banco (MyISAM)** |
+| Erro de `LOCK TABLES` | Peça à hospedagem a permissão `LOCK TABLES` para o usuário |
+| `server version mismatch` (PostgreSQL) | Atualize o `postgresql-client` no `Dockerfile` |
 
-O padrão é **REQUIRED**, que exige criptografia da conexão. Para verificar também o certificado e o nome do servidor, selecione **VERIFY_IDENTITY**, preferencialmente com CA do provedor.
+### O painel não mostra as mudanças depois de atualizar o código
 
-Se necessário, coloque o certificado CA em `certs/ca.pem` e cadastre apenas `ca.pem` no painel. A pasta é montada somente leitura em `/certs` nos dois serviços. Não coloque chave privada nessa pasta.
+Rode `docker compose up -d --build` e recarregue a página com **Ctrl+F5** (limpa o cache do navegador).
 
-`DISABLED` é uma opção explícita para rede confiável/túnel administrado. Não há fallback automático para conexão sem TLS.
+### `entrypoint.sh: not found` ou `\r: command not found`
 
-### Bancos legados
+Os arquivos foram convertidos para CRLF. Rode `git config core.autocrlf false`, apague a pasta e clone de novo.
 
-Antes de gerar o dump, Python identifica os motores de tabelas do banco:
+---
 
-- **Transação InnoDB:** usa `--single-transaction --quick`. Se detectar MyISAM/MEMORY/outros motores não transacionais, falha com uma mensagem explicativa.
-- **Bloqueio global:** usa `--lock-all-tables`, exige privilégios e pode impedir escritas em toda a instância durante o backup. Use somente numa janela de manutenção combinada com o provedor.
+## 8. Como o backup funciona por dentro
 
-Não faça migrações ALTER/CREATE/DROP/RENAME/TRUNCATE durante o backup InnoDB. O sistema não ignora erros do dump nem usa `--force` para fingir conclusão.
+1. O painel (Vue) envia os cadastros à API Laravel, com sessão e proteção CSRF.
+2. O Laravel guarda a senha do banco **criptografada** e grava agendamentos e fila no PostgreSQL de controle.
+3. O worker Python verifica a cada 15 s os agendamentos vencidos e a fila.
+4. A credencial é entregue ao worker pelo comando local `backups:payload`, via pipe. **Não existe endpoint HTTP que devolva senhas.**
+5. O dump (`mysqldump`, `pg_dump` ou `sqlite3 .dump`) é enviado em fluxo para gzip e criptografado na hora com **AES-256-GCM** em blocos. O SQL não é gravado em disco em texto aberto. As senhas não aparecem nos argumentos dos processos.
+6. O worker valida a criptografia e o gzip, calcula o SHA-256, faz a cópia externa (se exigida) e registra o resultado.
+7. A retenção só é aplicada após um backup bem-sucedido (e da cópia externa, quando habilitada).
+8. No download, o arquivo é descriptografado e entregue em ZIP **em fluxo**; nada descriptografado fica salvo no servidor.
 
-O dump inclui estrutura, dados, views, triggers, procedures, functions e events **conforme os privilégios concedidos ao usuário**. Se não houver permissão, a execução pode falhar; confira com o provedor.
+Nome do arquivo guardado: `db-<id-do-banco>_<data>_<hora>_job-<id-da-execução>.sql.gz.enc`.
 
-É um backup de um banco de aplicação, não uma imagem da instância. Não inclui binlogs, usuários/grants globais do servidor, arquivos enviados ao site ou configuração do MySQL. Bancos distintos não compartilham um snapshot transacional.
+### O que o dump MySQL inclui
 
-### Chaves
+Estrutura, dados, views, triggers, procedures, functions e events, **conforme as permissões do usuário**. Não inclui usuários/grants do servidor, binlogs, arquivos do site nem configuração do MySQL. Não faça alterações de estrutura (ALTER/DROP/RENAME/TRUNCATE) durante o backup. O sistema nunca usa `--force` para "fingir" sucesso.
 
-O container gera automaticamente, uma única vez:
+---
 
-- `/data/app.key`: chave Laravel, usada para abrir as credenciais.
-- `/data/keys/backup.key`: chave mestra dos arquivos criptografados.
+## 9. Segurança e chaves
 
-**Não execute `php artisan key:generate` nesta instalação Docker.** A chave compartilhada já é criada e persistida no volume. Uma mudança sem plano de rotação pode impedir o acesso às credenciais.
+No primeiro início, o container gera automaticamente, uma única vez:
 
-Faça uma cópia segura das duas chaves fora do servidor, separada dos backups. Quem possui a chave de backup pode descriptografar os arquivos; quem perde a chave não consegue recuperá-los. `APP_KEY`, quando definida explicitamente, tem precedência sobre `/data/app.key`: preserve a chave que de fato estiver em uso.
+| Arquivo | Para que serve |
+|---|---|
+| `/data/app.key` | Chave do Laravel. Abre as senhas dos bancos cadastrados |
+| `/data/keys/backup.key` | Chave mestra dos arquivos de backup |
+| `/data/keys/ssh_known_hosts` | Chaves SSH registradas dos servidores SQLite remotos |
 
-O worker usa um arquivo temporário de opções MySQL com permissão 0600, removido ao finalizar; a senha não aparece nos argumentos do processo. Temporários deixados por interrupção abrupta são removidos no próximo início do worker.
+- **Faça cópia segura das duas chaves fora deste servidor**, separada dos backups:
+  ```powershell
+  docker compose cp app:/data/app.key ./app.key.copia
+  docker compose cp app:/data/keys/backup.key ./backup.key.copia
+  ```
+  Guarde as cópias em local protegido e apague-as da pasta do projeto.
+- **Sem a `backup.key`, os backups não podem ser recuperados.** Quem tem a chave consegue abrir os backups.
+- **Não rode `php artisan key:generate`** nesta instalação. Se `APP_KEY` for definida no `.env`, ela tem prioridade sobre `/data/app.key`: preserve a que estiver em uso.
+- O ZIP baixado contém o banco **aberto**. Guarde-o em local seguro e apague quando não precisar mais.
+- **TLS:** use **Exigir TLS** ou **TLS + validar identidade** sempre que o servidor suportar. **Sem TLS** é para servidores que não suportam criptografia ou para redes/túneis confiáveis; nesse caso os dados trafegam sem criptografia entre a máquina e o servidor do banco (o arquivo de backup continua criptografado).
+- Certificados CA: coloque o `.pem` em `certs/` e informe só o nome do arquivo no painel. Nunca coloque chaves privadas ou senhas nessa pasta.
 
-## Retenção, disco e cópia externa
+---
 
-Em **Configurações**, ajuste:
+## 10. Restauração de um backup
 
-- Quantidade de backups mantidos por banco (padrão 4).
-- Tempo máximo do processo de dump (padrão 360 minutos). Consultas iniciais, validação final e envio externo são etapas adicionais.
-- Reserva mínima de espaço (padrão 1 GB).
-- Exigência de cópia externa.
+**Backup validado não é o mesmo que backup restaurado.** Faça um teste de restauração pelo menos uma vez por mês, num banco separado.
 
-Dimensione espaço a partir do primeiro backup medido. A compressão depende dos dados; o sistema não promete tamanho ou duração fixos. O dump é gerado diretamente no arquivo comprimido/criptografado para reduzir uso de memória e disco temporário.
+1. No painel, baixe o ZIP da execução desejada e extraia o `.sql`.
+2. Crie um **banco vazio de teste** com versão compatível.
+3. Importe:
+   ```bash
+   # MySQL
+   mysql -h HOST -u USUARIO -p banco_de_teste < arquivo.sql
+   # PostgreSQL
+   psql -h HOST -U USUARIO -d banco_de_teste -f arquivo.sql
+   # SQLite
+   sqlite3 novo_banco.sqlite < arquivo.sql
+   ```
+4. Confira a quantidade de tabelas e registros críticos, as views e rotinas, e se a aplicação funciona.
 
-Para cópia externa, primeiro configure um volume remoto no host, como um armazenamento montado em `/mnt/backup-remoto`. Descomente e ajuste no serviço `worker` do Compose:
+O dump MySQL não contém `CREATE DATABASE`/`USE`, para permitir a importação em qualquer banco. Revise `DEFINER` e privilégios antes de importar em outro servidor.
+
+### Restauração manual sem o painel
+
+Se o painel não estiver disponível, mas o volume e a chave existirem:
+
+```powershell
+docker compose exec --user www-data worker /opt/worker-venv/bin/python python/worker.py zip --input /data/backups/NOME-DO-ARQUIVO.sql.gz.enc --output /data/tmp/restauracao.zip --name restauracao.sql
+docker compose cp worker:/data/tmp/restauracao.zip ./restauracao.zip
+docker compose exec --user www-data worker rm /data/tmp/restauracao.zip
+```
+
+---
+
+## 11. Retenção, disco e cópia externa
+
+Em **Configurações**:
+
+| Opção | Padrão | Descrição |
+|---|---|---|
+| Backups mantidos por banco | 4 | Os mais antigos concluídos são apagados (o histórico continua) |
+| Tempo máximo do dump | 360 min | Aumente para bancos legados muito grandes |
+| Reserva mínima de disco | 1 GB | O backup para se o espaço livre ficar abaixo disso |
+| Exigir cópia externa | desligado | Copia cada backup para `/external` e confere o SHA-256 |
+
+Para a cópia externa, monte o destino no host e descomente no serviço `worker` do `docker-compose.yml`:
 
 ```yaml
 volumes:
   - /mnt/backup-remoto:/external
 ```
 
-O usuário do worker (UID/GID 33) precisa conseguir escrever nesse destino. Reinicie os serviços após alterar o Compose e só então ative **Exigir cópia externa** no painel. O sistema não configura S3/SFTP/montagem remota por conta própria.
+O usuário do container (UID/GID 33) precisa ter permissão de escrita. Rode `docker compose up -d` e só então ative **Exigir cópia externa**. Se a cópia falhar, o backup local é preservado, a execução fica como falha e a retenção não é aplicada.
 
-A cópia é escrita como `.partial`, tem SHA-256 conferido e só então recebe o nome final. Se falhar, o arquivo local completo é preservado em `/data/backups` e a execução fica como falha, sem aplicar retenção. Esse arquivo pode ser localizado pelo ID da execução no nome, mesmo que o painel não ofereça download daquela falha. Verifique capacidade e conectividade antes de repetir.
+---
 
-Retenção remove arquivos locais e cópias externas dos backups expirados; o histórico permanece. Configurações novas valem para as próximas execuções.
+## 12. Colocando em produção
 
-## Recuperação e teste de restauração
+A configuração padrão publica o painel só em `127.0.0.1:8190`, o que serve para testes locais. Para acesso remoto:
 
-**Backup validado por gzip/criptografia não equivale a SQL restaurado.** Faça restauração pelo menos mensalmente, em banco separado e versão MySQL compatível.
+1. Coloque um proxy com **HTTPS** (Nginx, Caddy, Traefik) na frente da porta do painel.
+2. Ajuste o `.env`:
+   ```dotenv
+   APP_ENV=production
+   APP_DEBUG=false
+   APP_URL=https://backup.seudominio.com.br
+   SESSION_SECURE_COOKIE=true
+   ```
+3. Para alertas por e-mail, configure `MAIL_MAILER=smtp`, `MAIL_HOST`, `MAIL_PORT`, `MAIL_USERNAME`, `MAIL_PASSWORD`, `MAIL_FROM_ADDRESS` e `BACKUP_ALERT_EMAIL`. Com `MAIL_MAILER=log`, nenhum e-mail é enviado de verdade.
+4. Rode `docker compose up -d --build`.
 
-Liste os arquivos:
-
-```powershell
-docker compose exec --user www-data worker ls -lh /data/backups
-```
-
-Substitua `NOME-DO-ARQUIVO` pelo arquivo real:
-
-```powershell
-docker compose exec --user www-data worker /opt/worker-venv/bin/python python/worker.py decrypt --input /data/backups/NOME-DO-ARQUIVO.sql.gz.enc --output /data/tmp/restauracao.sql.gz
-docker compose exec --user www-data worker gzip -t /data/tmp/restauracao.sql.gz
-docker compose cp worker:/data/tmp/restauracao.sql.gz ./restauracao.sql.gz
-```
-
-A saída precisa ser um arquivo novo: o descriptografador não sobrescreve. Se a autenticação falhar, apaga a saída parcial.
-
-O dump não inclui CREATE DATABASE/USE, para permitir a importação em outro banco. Crie um banco vazio de teste, mantenha seus eventos desativados, revise DEFINER/privilégios e importe com cliente MySQL compatível. Exemplo em Linux, com um arquivo de credenciais de restauração 0600 já configurado:
-
-```bash
-bash -o pipefail -c 'gzip -dc restauracao.sql.gz | mysql --defaults-extra-file=/caminho/restore-client.cnf banco_de_teste'
-```
-
-Confira o código de saída, contagens de tabelas/registros críticos, views, rotinas e comportamento da aplicação. Só depois planeje uma eventual restauração em produção. Remova a cópia descriptografada quando terminar.
-
-## Alertas e manutenção
-
-- O painel mostra quando o worker está sem contato recente. A atualização de heartbeat acontece durante o dump e a validação.
-- Falhas são registradas no histórico com mensagem e horários.
-- Para alertar por e-mail, configure `BACKUP_ALERT_EMAIL` e o mailer SMTP do Laravel em `.env`, depois recrie os serviços. O padrão `MAIL_MAILER=log` apenas registra o envio, não manda e-mail real.
-- Se o worker parar por completo, ele não consegue enviar alerta da própria ausência. Monitore a saúde e a idade do último backup bem-sucedido por banco externamente.
-- Faça cópia segura do banco de controle e das chaves. Para copiar o SQLite de forma consistente, pare os serviços/coloque em manutenção ou use a API de backup SQLite.
-- Os dados persistem no volume `backup_data`. **Não execute `docker compose down -v`**, pois isso apaga volumes, chaves e backups.
-- Docker tem rotação dos logs de container configurada. Configure rotação do arquivo Laravel `storage/logs/laravel.log` conforme o servidor.
-- Terça/sexta deixa uma janela de perda desde a última cópia. Arquivamento de binlogs para recuperação ponto a ponto não está implementado nesta entrega.
-
-Para redefinir/criar acesso administrativo:
-
-```powershell
-docker compose exec --user www-data app php artisan backups:install
-```
-
-O comando confirma antes de alterar uma instalação já existente e não recria chaves/bancos existentes.
-
-## Produção
-
-A configuração inicial publica apenas em `127.0.0.1:8190`, adequada ao teste local. Para acesso remoto, coloque um proxy com HTTPS na frente do serviço e configure:
-
-```dotenv
-APP_ENV=production
-APP_DEBUG=false
-APP_URL=https://backup.seudominio.com.br
-SESSION_SECURE_COOKIE=true
-```
-
-Não exponha `/data`, o código-fonte, `.env` ou certificados privados pela web. O Nginx incluído serve apenas `public`. Mantenha autenticação, firewall e acesso administrativo restritos.
-
-O Docker usa o cliente Oracle MySQL 8.0 fornecido pelo Ubuntu 24.04. Confira compatibilidade com a versão exata do MySQL remoto antes de aprovar o primeiro backup. Se necessário, ajuste a imagem para um cliente Oracle compatível; o worker não usa cliente MariaDB como substituto.
-
-## Desenvolvimento sem Docker
-
-Requer Linux/WSL, PHP 8.3 com extensões Laravel e SQLite, Composer, Node 22+, Python 3.12 com cryptography, cliente Oracle MySQL e acesso a cron/systemd.
-
-Use caminhos locais absolutos em `.env`: `BACKUP_DATA_PATH` e `DB_DATABASE`. Crie os diretórios `keys`, `tmp` e `backups` dentro do diretório de dados. Execute `docker/provision.py` com o mesmo BACKUP_DATA_PATH para criar as chaves e o SQLite, depois:
-
-```bash
-composer install
-php artisan migrate
-php artisan backups:install
-npm ci
-npm run build
-python3 -m venv .venv
-.venv/bin/pip install -r python/requirements.txt
-php artisan serve --host=127.0.0.1 --port=8190
-```
-
-Inicie Python em outro terminal, com o ambiente exportado (ele não carrega `.env` automaticamente):
-
-```bash
-BACKUP_DATA_PATH=/caminho/dados BACKUP_APP_PATH=/caminho/projeto PHP_BIN=/usr/bin/php .venv/bin/python python/worker.py
-```
-
-Use `--once` para uma execução única da fila/agendamentos. Pode ser chamado por cron a cada minuto, em lugar do daemon, sempre com os mesmos caminhos, usuário e ambiente. O lock impede concorrência. Não execute workers no Windows nativo: utilizam recursos POSIX; use Docker ou WSL.
-
-## Testes da entrega
-
-```bash
-composer test
-python3 -m unittest discover -s python/tests -v
-PHP_BIN=/usr/bin/php python3 python/tests/integration_laravel.py
-npm run build
-```
-
-O teste de integração cria banco de controle/chaves temporários, usa Laravel real, servidor HTTP local e clientes MySQL simulados. Não usa credenciais reais nem faz conexão no banco do usuário.
-
-- API Laravel: login, autorização, segredo criptografado/oculto, horários/dias, fila duplicada, banco pausado, edição e configurações.
-- Python: criptografia em blocos, gzip, adulteração, arquivo truncado, falhas de dump, MyISAM, limpeza e cópia externa/checksum.
-- Integração: Laravel abre credencial em pipe, Python executa backup simulado, histórico e download autenticado; valida CSRF e sessão por HTTP real.
-
-O build Docker e a restauração SQL real precisam ser validados no ambiente de instalação; não foram executados nesta sessão.
+Recomendações:
+- Não exponha `/data`, `.env`, o código-fonte nem a porta do PostgreSQL.
+- Monitore de fora a idade do último backup bem-sucedido de cada banco. Se o worker parar por completo, ele não consegue avisar a própria ausência.
+- Faça cópia do banco de controle (`pg_dump` do container `db`) e das chaves.
+- Agendar terça e sexta deixa uma janela de perda desde a última cópia. Ajuste os dias conforme a criticidade.

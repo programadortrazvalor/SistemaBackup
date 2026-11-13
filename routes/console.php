@@ -12,7 +12,7 @@ Artisan::command('backups:install',function(){
     SisUsuario::updateOrCreate(['email'=>$email],['nome'=>$name,'password'=>$pass,'celular'=>$celular,'cpf'=>$cpf,'data_nascimento'=>$nascimento,'status'=>'L']);
     if(!SisDatabaseServer::exists()){
         $dbpass=$this->secret('Senha MySQL de dyisencoes01 (Enter para configurar depois)');
-        $d=SisDatabaseServer::create(['name'=>'DY Isenções','host'=>'mysql29-farm15.uni5.net','port'=>3306,'database_name'=>'dyisencoes01','username'=>'dyisencoes01','db_password'=>$dbpass??'','tls_mode'=>'REQUIRED','consistency'=>'transaction','enabled'=>strlen((string)$dbpass)>0]);
+        $d=SisDatabaseServer::create(['name'=>'Traz Valor','driver'=>'mysql','host'=>'mysql29-farm15.uni5.net','port'=>3306,'database_name'=>'dyisencoes01','username'=>'dyisencoes01','db_password'=>$dbpass??'','tls_mode'=>'REQUIRED','consistency'=>'transaction','enabled'=>strlen((string)$dbpass)>0]);
         SisBackupSchedule::create(['database_server_id'=>$d->id,'weekdays'=>[2,5],'start_time'=>'17:30','enabled'=>true]);
     }
     foreach(['retention_count'=>'4','timeout_minutes'=>'360','minimum_free_gb'=>'1','external_copy'=>'0'] as $k=>$v)DB::table('sis_backup_settings')->insertOrIgnore(['key'=>$k,'value'=>$v]);
@@ -22,7 +22,7 @@ Artisan::command('backups:payload {run}',function(){
     // Exclusivo do processo local. Não existe endpoint HTTP de credenciais.
     $run=SisBackupRun::findOrFail((int)$this->argument('run'));$d=$run->databaseServer;
     if($run->status!=='running' || !$d->enabled){$this->error('Execução indisponível.');return 1;}
-    $this->line(json_encode(['id'=>$d->id,'name'=>$d->name,'host'=>$d->host,'port'=>$d->port,'database'=>$d->database_name,'username'=>$d->username,'password'=>$d->db_password,'tls_mode'=>$d->tls_mode,'ca_file'=>$d->ca_file,'consistency'=>$d->consistency],JSON_THROW_ON_ERROR));
+    $this->line(json_encode(['id'=>$d->id,'name'=>$d->name,'driver'=>$d->driver??'mysql','host'=>$d->host,'port'=>$d->port,'database'=>$d->database_name,'username'=>$d->username,'password'=>$d->db_password,'tls_mode'=>$d->tls_mode,'ca_file'=>$d->ca_file,'consistency'=>$d->consistency],JSON_THROW_ON_ERROR));
 })->purpose('Entrega credencial em pipe ao worker local');
 Artisan::command('backups:notify {run}',function(){
     $to=config('backups.alert_email');if(!$to)return;

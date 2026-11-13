@@ -43,6 +43,37 @@ class BackupApiTest extends TestCase {
         $this->actingAs($this->admin());$this->putJson('/api/settings',['retention_count'=>0])->assertUnprocessable();
         $this->putJson('/api/settings',['retention_count'=>6,'timeout_minutes'=>60,'minimum_free_gb'=>2,'external_copy'=>true])->assertOk()->assertJsonPath('external_copy',true);
     }
+    public function test_create_postgres_and_sqlite_databases():void{
+        $this->actingAs($this->admin());
+        $this->postJson('/api/databases',['name'=>'PG','driver'=>'pgsql','host'=>'pg.example.test','port'=>5432,'database_name'=>'app','username'=>'u','db_password'=>'secret-pg','tls_mode'=>'REQUIRED','consistency'=>'locked','enabled'=>true])->assertOk()->assertJson(['driver'=>'pgsql','consistency'=>'transaction']);
+        $this->postJson('/api/databases',['name'=>'Local','driver'=>'sqlite','database_name'=>'app.sqlite','enabled'=>true])->assertOk()->assertJson(['driver'=>'sqlite','host'=>null]);
+        foreach(['../etc/passwd','..','a/b.db'] as $bad)$this->postJson('/api/databases',['name'=>'X','driver'=>'sqlite','database_name'=>$bad,'enabled'=>true])->assertUnprocessable();
+        $ssh=['name'=>'Remoto','driver'=>'sqlite','host'=>'srv.example.test','port'=>22,'database_name'=>'/home/app/db.sqlite','username'=>'deploy','tls_mode'=>'DISABLED','consistency'=>'transaction','enabled'=>true];
+        $this->postJson('/api/databases',$ssh)->assertUnprocessable(); // senha SSH obrigatória
+        $this->postJson('/api/databases',['database_name'=>'/home/../etc/shadow','db_password'=>'x']+$ssh)->assertUnprocessable();
+        $this->postJson('/api/databases',['db_password'=>'ssh-secret']+$ssh)->assertOk()->assertJson(['driver'=>'sqlite','host'=>'srv.example.test','database_name'=>'/home/app/db.sqlite']);
+        $this->postJson('/api/databases',['name'=>'X','driver'=>'oracle','database_name'=>'x','enabled'=>true])->assertUnprocessable();
+        $this->assertDatabaseCount('sis_database_servers',3);
+    }
+    public function test_switch_sqlite_to_mysql_requires_password():void{
+        $this->actingAs($this->admin());$d=SisDatabaseServer::create(['name'=>'L','driver'=>'sqlite','database_name'=>'a.sqlite','tls_mode'=>'DISABLED','consistency'=>'transaction','enabled'=>true]);
+        $body=['name'=>'L','driver'=>'mysql','host'=>'h','port'=>3306,'database_name'=>'a','username'=>'u','db_password'=>'','tls_mode'=>'REQUIRED','consistency'=>'transaction','enabled'=>true];
+        $this->putJson('/api/databases/'.$d->id,$body)->assertUnprocessable();
+        $this->putJson('/api/databases/'.$d->id,['db_password'=>'p']+$body)->assertOk()->assertJson(['driver'=>'mysql']);
+    }
+    public function test_schedules_follow_database_status():void{
+        $this->actingAs($this->admin());$d=$this->database();
+        $s=\App\Models\SisBackupSchedule::create(['database_server_id'=>$d->id,'weekdays'=>[2,5],'start_time'=>'17:30','enabled'=>true]);
+        $body=['db_password'=>'']+$d->toArray();
+        $this->putJson('/api/databases/'.$d->id,['enabled'=>false]+$body)->assertOk();
+        $this->assertFalse($s->fresh()->enabled);
+        // banco inativo: não deixa ativar o agendamento, mas salva desativado
+        $sched=['database_server_id'=>$d->id,'weekdays'=>[2,5],'start_time'=>'17:30'];
+        $this->putJson('/api/schedules/'.$s->id,$sched+['enabled'=>true])->assertUnprocessable();
+        $this->putJson('/api/schedules/'.$s->id,['enabled'=>false,'start_time'=>'18:00']+$sched)->assertOk();
+        $this->putJson('/api/databases/'.$d->id,['enabled'=>true]+$body)->assertOk();
+        $this->assertTrue($s->fresh()->enabled);$this->assertSame('18:00',$s->fresh()->start_time);
+    }
     public function test_missing_or_expired_download_is_not_available():void{
         $this->actingAs($this->admin());$d=$this->database();$run=SisBackupRun::create(['database_server_id'=>$d->id,'source'=>'manual','status'=>'expired','filename'=>'unavailable.enc']);$this->get('/api/runs/'.$run->id.'/download')->assertNotFound();
     }

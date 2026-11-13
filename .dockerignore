@@ -13,3 +13,5 @@ bootstrap/cache/*.php
 **/__pycache__
 **/*.pyc
 *.zip
+sqlite/*
+!sqlite/.gitignore
